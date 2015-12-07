@@ -53,7 +53,7 @@ blocks = 96 // 2
 operations = blocks * threads
 results = numpy.repeat(numpy.array([result], dtype=numpy.float32), operations)
 ###############################################################################
-iterations = 1
+iterations = 10000
 exponent = 0.7
 delta = 0.1
 
@@ -61,7 +61,9 @@ best = (result, state, exponent)
 for i in range(iterations):    
     configuration = best[1].reshape((1, V))
     configuration = numpy.repeat(configuration, operations, axis=0)
+    
     results = numpy.repeat(numpy.array([best[0]], dtype=numpy.float32), operations)
+
     exponent = best[2]
     high = numpy.max(0.000001, exponent + delta - 1./operations)
     low = numpy.max(0.000001, exponent - delta)
@@ -81,7 +83,7 @@ for i in range(iterations):
         d_temperatures = numba.cuda.to_device(temperatures, stream=stream)
         d_configuration = numba.cuda.to_device(configuration, stream=stream)
         
-        execute(d_results, d_distances, d_uniform, d_configuration, d_temperatures, d_b, d_e)
+        execute(d_results, d_distances, d_uniform, d_configuration, d_temperatures)
 
         d_results.to_host(stream=stream)
         d_temperatures.to_host(stream=stream)
