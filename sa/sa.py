@@ -67,9 +67,6 @@ for i in range(iterations):
     low = numpy.max(0.000001, exponent - delta)
     temperatures = numpy.array(numpy.linspace(low, high, num=operations), dtype=numpy.float32, order='F')
 
-    b_ = numpy.zeros((operations,), dtype=numpy.uint16, order='F')
-    e_ = numpy.zeros((operations,), dtype=numpy.uint16, order='F')
-
     stream = numba.cuda.stream()
     with stream.auto_synchronize():
         entropy = operations * cycles * 3
@@ -79,19 +76,12 @@ for i in range(iterations):
 
         execute = sa2opt[(blocks, 1), (threads, 1), stream]
 
-        d_b = numba.cuda.to_device(b_, stream=stream)
-        d_e = numba.cuda.to_device(e_, stream=stream)
-
         d_results = numba.cuda.to_device(results, stream=stream)
         d_distances = numba.cuda.to_device(distances, stream=stream)
         d_temperatures = numba.cuda.to_device(temperatures, stream=stream)
         d_configuration = numba.cuda.to_device(configuration, stream=stream)
         
         execute(d_results, d_distances, d_uniform, d_configuration, d_temperatures, d_b, d_e)
-
-
-        d_b.to_host(stream=stream)
-        d_e.to_host(stream=stream)
 
         d_results.to_host(stream=stream)
         d_temperatures.to_host(stream=stream)
