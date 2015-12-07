@@ -14,7 +14,9 @@ for file in files:
     print(str(index).zfill(3), '\t', file, end=end) 
     index+=1
 print()    
-problem = int(input('problem number>'))
+problem = 0
+if os.getenv('PROFILE') is None:
+    problem = int(input('problem number>'))
 vertices, labels = tsplib.parse("tsplib/" + files[problem])
 V = len(vertices)
 print("Vertices: ", V)
@@ -23,6 +25,12 @@ print("Vertices: ", V)
 import numpy
 z = numpy.array([[complex(c[1][0], c[1][1]) for c in vertices.items()]])
 distances = numpy.array(numpy.round(abs(z.T - z)), dtype=numpy.float32, order='F')
+
+
+# in the worst case we swap the smallest route with the largest
+smallest = 2 * numpy.min(distances[numpy.nonzero(distances)])
+largest = 2 * numpy.max(distances[numpy.nonzero(distances)])
+domain = largest - smallest
 
 # In[3]:
 # The order given by the TSPLib format is near optimal,
@@ -44,82 +52,100 @@ import numbapro
 from numbapro.cudalib import curand
 
 numba.cuda.profile_start()
-cycles = 10
-import optimise
-sa2opt = optimise.CreateKernel(V, cycles, 0.99)
+cycles = V
 
-# precautions: 64/1024, 48/96
-threads = min(512, numba.cuda.get_current_device().MAX_THREADS_PER_BLOCK)
-blocks = 96 // 2
+
+# precautions: 64/768, 48/96
+threads = min(256, numba.cuda.get_current_device().MAX_THREADS_PER_BLOCK)
+blocks = 96 // 4
 operations = blocks * threads
-results = numpy.repeat(numpy.array([result], dtype=numpy.float32), operations)
-###############################################################################
-iterations = 10000
-initial_exponent = 0.7
-delta = 0.25
+#results = numpy.repeat(numpy.array([result], dtype=numpy.float32), operations)
+results = numba.cuda.pinned_array(operations, dtype=numpy.float32, order='F')
+for o in range(operations):
+    results[o] = result
 
+import optimise
+sa2opt = optimise.CreateKernel(V, cycles, domain, 0.995)
+
+###############################################################################
+iterations = 100
+initial_exponent = 0.7
+delta = 0.28
 best = (result, state, initial_exponent)
+configuration = numba.cuda.pinned_array((operations,V), dtype=numpy.uint16, order='F')
+stream = numba.cuda.stream()
+
+d_distances = numba.cuda.to_device(distances)
+
+@numba.jit 
+def Copy(config, energy):
+    for o in range(operations):
+        configuration[o, :] = config
+Copy(best[1], best[0])
+    
+d_results = numba.cuda.to_device(results, stream=stream)
+d_configuration = numba.cuda.to_device(configuration, stream=stream)
+
+output = numba.cuda.pinned_array((V,), dtype=numpy.uint16, order='F')
+for i in range(V):
+        output[i] = state[i]
+
+entropy = operations * cycles * 3
+d_uniform = numba.cuda.device_array(entropy, dtype=numpy.float32, stream=stream)
+generator = curand.PRNG(curand.PRNG.MRG32K3A, stream=stream, seed=0)
 
 for i in range(iterations):    
+    
+    # every iteration only set temperatures
     exponent = best[2]
     high = numpy.max(0.000001, exponent + delta - 1./operations)
     low = numpy.max(0.000001, exponent - delta)
     temperatures = numpy.array(numpy.linspace(low, high, num=operations), dtype=numpy.float32, order='F')
 
-    configuration = best[1].reshape((1, V))
-    configuration = numpy.repeat(configuration, operations, axis=0)
-    results = numpy.repeat(numpy.array([best[0]], dtype=numpy.float32), operations)
-    d_distances = numba.cuda.to_device(distances)
-
-    stream = numba.cuda.stream()
     with stream.auto_synchronize():
-        entropy = operations * cycles * 3
-        d_uniform = numba.cuda.device_array(entropy, dtype=numpy.float32, stream=stream)
-        generator = curand.PRNG(curand.PRNG.MRG32K3A, stream=stream, seed=0)
         generator.uniform(d_uniform)
 
-        execute = sa2opt[(blocks, 1), (threads, 1), stream]
+        execute = sa2opt[(blocks, ), (threads, ), stream]
 
-        d_results = numba.cuda.to_device(results, stream=stream)
+        d_output = numba.cuda.to_device(output, stream)
         d_temperatures = numba.cuda.to_device(temperatures, stream=stream)
-        d_configuration = numba.cuda.to_device(configuration, stream=stream)
         
-        execute(d_results, d_distances, d_uniform, d_configuration, d_temperatures)
-
-        d_results.to_host(stream=stream)
-        d_temperatures.to_host(stream=stream)
-        d_configuration.to_host(stream=stream)
+        execute(d_results, d_distances, d_uniform, d_configuration, d_temperatures, d_output)
+        d_output.to_host(stream=stream)
     
-    local = numpy.min(results)
-    first = numpy.where(results == local)[0][0]
-    print((numpy.min(results),numpy.mean(results), exponent))
-    sequence = configuration[first, :]
-    
-    if local < best[0]:
-        best = (local, sequence, numpy.min(exponent * 0.98, 0.9))#, temperatures[first]))
-        last = numpy.where(results == numpy.max(results))[0]
-        
+    local = 0.
+    for i in range(V):
+        local += distances[output[i], output[(1 + i) % V]]
 
+    adaptive = min(0.99, local/best[0])
+    print(local, exponent)
+    if local < best[0] and len(set(output)) == V:
+        assert len(set(output)) == V, 'state corrupted, check for cuda errors'
+        best = (local, output, exponent * adaptive)
     else:
-        # should restart all
-        break
-
-###############################################################################
-import matplotlib.pyplot as plt
-
-figure = plt.figure()
-
-sequence = list(zip(*list(map(lambda v: vertices[v], best[1]))))
-plt.plot(sequence[0], sequence[1])
-plt.scatter(sequence[0], sequence[1])
-figure.show()
+        if len(set(output)) == V:
+            best = (local, output, exponent * 0.98)
+        else:
+            best = (best[0], best[1], exponent * 0.98)
+        #break
 
 
 
-
-
-    
 numba.cuda.profile_stop()
+###############################################################################
+if os.getenv('PROFILE') is None:
+    import matplotlib.pyplot as plt
 
-input("exit>")
+    figure = plt.figure()
+
+    sequence = list(zip(*list(map(lambda v: vertices[v], best[1]))))
+    plt.plot(sequence[0], sequence[1], 'b')
+    plt.plot([sequence[0][0], sequence[0][-1]], [sequence[1][0], sequence[1][-1]], 'b')
+
+    plt.scatter(sequence[0], sequence[1])
+    figure.show()
+
+
+    input("exit>")
+print('done')
 sys.exit(0)
