@@ -24,6 +24,7 @@
     <EnableUnmanagedDebugging>false</EnableUnmanagedDebugging>
   </PropertyGroup>
   <ItemGroup>
+    <Compile Include="analysis.py" />
     <Compile Include="optimise.py">
       <SubType>Code</SubType>
     </Compile>

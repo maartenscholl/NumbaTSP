@@ -35,9 +35,10 @@ domain = largest - smallest
 # In[3]:
 # The order given by the TSPLib format is near optimal,
 # so we shuffle it to a random state to make the problem more interesting
+
 state = numpy.array(list(range(V)), dtype=numpy.uint16)
 import random
-random.seed(0)
+random.seed(0 )
 random.shuffle(state)
 
 result = 0.
@@ -52,12 +53,10 @@ import numbapro
 from numbapro.cudalib import curand
 
 numba.cuda.profile_start()
-cycles = V
+cycles = max(1000, V * 2)
 
-
-# precautions: 64/768, 48/96
 threads = min(256, numba.cuda.get_current_device().MAX_THREADS_PER_BLOCK)
-blocks = 96 // 4
+blocks = 1
 operations = blocks * threads
 #results = numpy.repeat(numpy.array([result], dtype=numpy.float32), operations)
 results = numba.cuda.pinned_array(operations, dtype=numpy.float32, order='F')
@@ -65,12 +64,13 @@ for o in range(operations):
     results[o] = result
 
 import optimise
-sa2opt = optimise.CreateKernel(V, cycles, domain, 0.995)
+sa2opt = optimise.CreateKernel(V, cycles, domain, 0.96)
+#sa2opt = optimise.CreateKernelAnalysis(V, cycles, domain, 0.995)
 
 ###############################################################################
 iterations = 100
-initial_exponent = 0.7
-delta = 0.28
+initial_exponent = 0.3 # 0.7
+delta = 0.7
 best = (result, state, initial_exponent)
 configuration = numba.cuda.pinned_array((operations,V), dtype=numpy.uint16, order='F')
 stream = numba.cuda.stream()
@@ -92,44 +92,47 @@ for i in range(V):
 
 entropy = operations * cycles * 3
 d_uniform = numba.cuda.device_array(entropy, dtype=numpy.float32, stream=stream)
-generator = curand.PRNG(curand.PRNG.MRG32K3A, stream=stream, seed=0)
+generator = curand.PRNG(curand.PRNG.MRG32K3A, stream=stream, seed=0 )
 
-for i in range(iterations):    
-    
+energy = numpy.zeros((iterations, 1), dtype=numpy.float32)
+#traces = numpy.zeros((iterations, operations, cycles), dtype=numpy.float32)
+#d_traces = numba.cuda.to_device(traces)
+
+
+for iteration in range(iterations):    
     # every iteration only set temperatures
     exponent = best[2]
-    high = numpy.max(0.000001, exponent + delta - 1./operations)
-    low = numpy.max(0.000001, exponent - delta)
-    temperatures = numpy.array(numpy.linspace(low, high, num=operations), dtype=numpy.float32, order='F')
+    high = exponent * (1.0 + 1.0 - delta) + 0.01
+    low = exponent * delta
+    temperatures = numpy.array(numpy.logspace(low, high, num=operations), dtype=numpy.float32, order='F')
 
     with stream.auto_synchronize():
         generator.uniform(d_uniform)
-
         execute = sa2opt[(blocks, ), (threads, ), stream]
-
         d_output = numba.cuda.to_device(output, stream)
         d_temperatures = numba.cuda.to_device(temperatures, stream=stream)
-        
         execute(d_results, d_distances, d_uniform, d_configuration, d_temperatures, d_output)
+        #execute(d_results, d_distances, d_uniform, d_configuration, d_temperatures, d_output, d_traces, iteration)
+        #d_traces.to_host(stream=stream)
         d_output.to_host(stream=stream)
     
     local = 0.
     for i in range(V):
         local += distances[output[i], output[(1 + i) % V]]
 
-    adaptive = min(0.99, local/best[0])
-    print(local, exponent)
+    energy[iteration] = local
+
+    adaptive = max(0.99, min(0.997, (local/best[0])))
+    print(local, exponent, low, high, adaptive)
     if local < best[0] and len(set(output)) == V:
         assert len(set(output)) == V, 'state corrupted, check for cuda errors'
         best = (local, output, exponent * adaptive)
     else:
         if len(set(output)) == V:
-            best = (local, output, exponent * 0.98)
+            best = (local, output, exponent * 0.997)
         else:
-            best = (best[0], best[1], exponent * 0.98)
+            best = (best[0], best[1], exponent * 0.997)
         #break
-
-
 
 numba.cuda.profile_stop()
 ###############################################################################
@@ -141,9 +144,40 @@ if os.getenv('PROFILE') is None:
     sequence = list(zip(*list(map(lambda v: vertices[v], best[1]))))
     plt.plot(sequence[0], sequence[1], 'b')
     plt.plot([sequence[0][0], sequence[0][-1]], [sequence[1][0], sequence[1][-1]], 'b')
-
     plt.scatter(sequence[0], sequence[1])
     figure.show()
+
+
+
+    figure = plt.figure()
+    plt.plot(list(range(iterations)), energy)
+    figure.show()
+    '''
+    cmap = plt.get_cmap('jet')
+    colors = [cmap(i) for i in numpy.linspace(0, 1, operations)]
+
+    
+
+    minima = numpy.zeros((iterations * cycles, 1), dtype=numpy.float32)
+
+    figure = plt.figure()
+    for o in range(operations):
+        trace = traces[:,o,:].flatten()
+
+        for j in range(iterations * cycles):
+            minima[j] = trace[j] if 0 == o else min(trace[j], minima[j], minima[j-1] if j > 0 else minima[j])
+
+        plt.plot(trace, color=colors[o], label='process ' + str(o+1))
+
+    plt.plot(minima, color='grey', label='current best')
+    plt.xlabel('t')
+    plt.ylabel('E')
+    for v in range(cycles, cycles * iterations + 1, cycles):
+        plt.axvline(v, color='grey')
+
+    plt.legend()
+    figure.show()
+    '''
 
 
     input("exit>")
